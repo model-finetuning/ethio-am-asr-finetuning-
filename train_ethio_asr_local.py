@@ -38,6 +38,7 @@ from transformers import (
     AutoProcessor,
     EarlyStoppingCallback,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -202,6 +203,20 @@ def add_waxal_replay(
         flush=True,
     )
     return mixed, stats
+
+
+def limit_evaluation_dataset(
+    dataset: Any, max_samples: int, seed: int, label: str
+) -> Any:
+    """Deterministically cap an evaluation dataset; zero means use every row."""
+    if max_samples <= 0 or len(dataset) <= max_samples:
+        return dataset
+    limited = dataset.shuffle(seed=seed).select(range(max_samples))
+    print(
+        f"Limited {label} evaluation to {len(limited):,}/{len(dataset):,} rows.",
+        flush=True,
+    )
+    return limited
 
 
 def assign_speaker_splits(
@@ -423,11 +438,50 @@ class LocalAudioPreprocessor:
     def __post_init__(self) -> None:
         self.input_name = self.processor.model_input_names[0]
         self.unknown_token_id = self.processor.tokenizer.unk_token_id
+        self._character_support_cache: dict[str, bool] = {}
+        self._reported_unsupported_characters: set[str] = set()
+
+    def sanitize_for_ctc(self, text: str) -> str:
+        """Replace tokenizer-unsupported characters with normalized spaces."""
+        if not self.validate_vocabulary or self.unknown_token_id is None:
+            return text
+
+        cleaned: list[str] = []
+        unsupported: set[str] = set()
+        for character in text:
+            if character.isspace():
+                cleaned.append(" ")
+                continue
+            supported = self._character_support_cache.get(character)
+            if supported is None:
+                character_ids = self.processor.tokenizer(
+                    character, add_special_tokens=False
+                ).input_ids
+                supported = bool(character_ids) and (
+                    self.unknown_token_id not in character_ids
+                )
+                self._character_support_cache[character] = supported
+            if supported:
+                cleaned.append(character)
+            else:
+                cleaned.append(" ")
+                unsupported.add(character)
+
+        newly_reported = unsupported - self._reported_unsupported_characters
+        if newly_reported:
+            printable = ", ".join(repr(char) for char in sorted(newly_reported))
+            print(
+                f"Removed tokenizer-unsupported transcript characters: {printable}",
+                flush=True,
+            )
+            self._reported_unsupported_characters.update(newly_reported)
+        return normalize_amharic_text("".join(cleaned))
 
     def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
         text = normalize_amharic_text(example.get("text") or "")
+        text = self.sanitize_for_ctc(text)
         if not text:
-            raise ValueError("Encountered an empty transcript")
+            raise ValueError("Transcript became empty after CTC vocabulary cleaning")
         waveform, source_rate, _ = read_local_audio(example["audio"])
         if source_rate != self.sample_rate:
             waveform = torchaudio.functional.resample(
@@ -446,7 +500,10 @@ class LocalAudioPreprocessor:
             and self.unknown_token_id is not None
             and self.unknown_token_id in labels
         ):
-            raise ValueError(f"Tokenizer produced <unk> for: {text[:250]}")
+            raise ValueError(
+                "Tokenizer still produced <unk> after character cleaning for: "
+                f"{text[:250]}"
+            )
         processed = self.processor(
             waveform.numpy(),
             sampling_rate=self.sample_rate,
@@ -478,6 +535,27 @@ class DataCollatorCTCWithPadding:
             label_batch["attention_mask"].ne(1), -100
         )
         return batch
+
+
+class RecoveryCheckpointCallback(TrainerCallback):
+    """Request a normal, resumable Trainer checkpoint at a shorter interval."""
+
+    def __init__(self, every_steps: int) -> None:
+        self.every_steps = every_steps
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        if (
+            self.every_steps > 0
+            and state.global_step > 0
+            and state.global_step % self.every_steps == 0
+        ):
+            if state.is_world_process_zero:
+                print(
+                    f"Saving recovery checkpoint at step {state.global_step}",
+                    flush=True,
+                )
+            control.should_save = True
+        return control
 
 
 def make_processed_split(
@@ -556,6 +634,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-percent", type=int, default=10)
     parser.add_argument("--inspection-audio-samples", type=int, default=3)
     parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument(
+        "--max-validation-samples",
+        type=int,
+        default=0,
+        help="Cap Leyu validation rows; 0 evaluates the complete split.",
+    )
+    parser.add_argument(
+        "--max-test-samples-per-dialect",
+        type=int,
+        default=0,
+        help="Cap each Leyu dialect test split; 0 evaluates every row.",
+    )
+    parser.add_argument(
+        "--max-waxal-test-samples",
+        type=int,
+        default=0,
+        help="Cap the Waxal retention test; 0 evaluates every row.",
+    )
     parser.add_argument("--max-steps", type=int, default=8_900)
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=2)
@@ -565,8 +661,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--eval-steps", type=int, default=1_000)
     parser.add_argument("--save-steps", type=int, default=1_000)
+    parser.add_argument(
+        "--recovery-save-steps",
+        type=int,
+        default=100,
+        help=(
+            "Save an additional resumable checkpoint this often without running "
+            "evaluation; 0 disables recovery-only saves."
+        ),
+    )
     parser.add_argument("--logging-steps", type=int, default=25)
-    parser.add_argument("--dataloader-workers", type=int, default=4)
+    parser.add_argument(
+        "--dataloader-workers",
+        type=int,
+        default=0,
+        help="Use 0 by default to avoid CUDA/PyArrow fork deadlocks on DGX Spark.",
+    )
     parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume-from-checkpoint")
@@ -591,6 +701,16 @@ def validate_arguments(args: argparse.Namespace, repo_ids: list[str]) -> None:
         raise ValueError("--waxal-replay-ratio must be in [0, 1)")
     if args.max_steps <= 0 and not args.inspect_only:
         raise ValueError("--max-steps must be positive")
+    if args.dataloader_workers < 0:
+        raise ValueError("--dataloader-workers cannot be negative")
+    if args.recovery_save_steps < 0:
+        raise ValueError("--recovery-save-steps cannot be negative")
+    if min(
+        args.max_validation_samples,
+        args.max_test_samples_per_dialect,
+        args.max_waxal_test_samples,
+    ) < 0:
+        raise ValueError("Evaluation sample limits cannot be negative")
     if args.save_steps % args.eval_steps:
         raise ValueError("--save-steps must be a multiple of --eval-steps")
     if min(
@@ -754,6 +874,28 @@ def main() -> None:
         )
         replay_stats["enabled"] = True
         waxal_test_dataset = load_waxal_split("test", data_dir, manifest)
+    validation_dataset = limit_evaluation_dataset(
+        validation_dataset,
+        args.max_validation_samples,
+        args.seed,
+        "Leyu validation",
+    )
+    test_by_dialect = {
+        dialect: limit_evaluation_dataset(
+            dataset,
+            args.max_test_samples_per_dialect,
+            args.seed,
+            f"Leyu {dialect} test",
+        )
+        for dialect, dataset in test_by_dialect.items()
+    }
+    if waxal_test_dataset is not None:
+        waxal_test_dataset = limit_evaluation_dataset(
+            waxal_test_dataset,
+            args.max_waxal_test_samples,
+            args.seed,
+            "Waxal test",
+        )
     collator = DataCollatorCTCWithPadding(
         processor, processor.model_input_names[0], preprocessor
     )
@@ -813,7 +955,10 @@ def main() -> None:
         data_collator=collator,
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[EarlyStoppingCallback(args.early_stopping_patience)],
+        callbacks=[
+            EarlyStoppingCallback(args.early_stopping_patience),
+            RecoveryCheckpointCallback(args.recovery_save_steps),
+        ],
     )
 
     train_result = trainer.train(
@@ -882,6 +1027,11 @@ def main() -> None:
         "best_validation_wer": trainer.state.best_metric,
         "split_totals": inspection["totals"],
         "waxal_replay": replay_stats,
+        "evaluation_limits": {
+            "validation": args.max_validation_samples,
+            "test_per_dialect": args.max_test_samples_per_dialect,
+            "waxal_test": args.max_waxal_test_samples,
+        },
         "test_metrics_by_dialect": test_metrics,
         "waxal_retention_test_metrics": waxal_test_metrics,
     }

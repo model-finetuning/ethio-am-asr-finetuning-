@@ -1,0 +1,17 @@
+[Unit]
+Description=Chaka Amharic ASR full training watchdog
+After=local-fs.target
+
+[Service]
+Type=simple
+User=milkesa
+WorkingDirectory=/home/milkesa/ethio-am-asr-finetuning-
+ExecStart=/home/milkesa/ethio-am-asr-finetuning-/.venv/bin/python -u /home/milkesa/ethio-am-asr-finetuning-/train_watchdog.py
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=120
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
