@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import platform
+import re
 import subprocess
 import sys
 from typing import Any
@@ -20,6 +21,13 @@ def package_version(name: str) -> str | None:
     except ImportError:
         return None
     return str(getattr(module, "__version__", "installed (version unavailable)"))
+
+
+def version_pair(version: str) -> tuple[int, int] | None:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def run_nvidia_smi() -> bool:
@@ -122,6 +130,7 @@ def check_packages() -> bool:
     packages = [
         "torch",
         "torchaudio",
+        "soundfile",
         "transformers",
         "accelerate",
         "jiwer",
@@ -134,14 +143,17 @@ def check_packages() -> bool:
 
     okay = all(version is not None for version in versions.values())
     if versions["torch"] and versions["torchaudio"]:
-        torch_series = versions["torch"].split("+")[0].split(".")[:2]
-        audio_series = versions["torchaudio"].split("+")[0].split(".")[:2]
-        if torch_series != audio_series:
-            okay = False
-            print(
-                "FAIL: torch and torchaudio major/minor versions differ. "
-                "Install matching releases."
-            )
+        torch_series = version_pair(versions["torch"])
+        audio_series = version_pair(versions["torchaudio"])
+        if torch_series and audio_series:
+            stable_abi_compatible = audio_series >= (2, 11) and torch_series >= (2, 11)
+            legacy_compatible = audio_series < (2, 11) and audio_series == torch_series
+            if not (stable_abi_compatible or legacy_compatible):
+                okay = False
+                print(
+                    "FAIL: TorchAudio 2.11+ requires PyTorch 2.11+. Older "
+                    "TorchAudio releases must match PyTorch's major/minor version."
+                )
     return okay
 
 
@@ -177,4 +189,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

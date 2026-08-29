@@ -1,7 +1,11 @@
-# Install PyTorch and TorchAudio from the official PyTorch CUDA index when your
-# GPU requires a specific CUDA build. Keep their major/minor versions aligned.
-torch>=2.6.0
-torchaudio>=2.6.0
+# NVIDIA GB10 / Linux aarch64: PyTorch 2.13 uses the stable CUDA 13 build.
+torch>=2.13.0,<2.14
+
+# TorchAudio 2.11 uses PyTorch's stable ABI and supports PyTorch 2.11+.
+torchaudio==2.11.0
+
+# Bundles libsndfile in its Linux ARM64 wheel, avoiding a system FFmpeg install.
+soundfile>=0.14.0,<0.15
 
 # ASR training stack
 transformers>=4.50.0
@@ -9,4 +13,3 @@ accelerate>=1.2.0
 jiwer>=3.0.0
 numpy>=1.26.0
 safetensors>=0.4.5
-

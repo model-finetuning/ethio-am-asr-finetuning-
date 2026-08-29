@@ -9,7 +9,8 @@ speaker_id is used for split-leakage warnings and prediction reports; other
 optional columns are ignored. Paths may be absolute or relative to the CSV file.
 
 Required packages:
-    torch, torchaudio, transformers, accelerate, jiwer, numpy, safetensors
+    torch, torchaudio, soundfile, transformers, accelerate, jiwer, numpy,
+    safetensors
 
 Example:
     python train_ethio_asr.py \
@@ -34,6 +35,7 @@ from typing import Any
 
 import jiwer
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 from torch.utils.data import Dataset
@@ -196,30 +198,22 @@ def preflight_audio_files(
     max_duration_seconds: float,
 ) -> None:
     """Read audio headers before training so bad files do not fail hours later."""
-    info_method = getattr(torchaudio, "info", None)
-    if info_method is None:
-        warn(
-            "torchaudio.info() is unavailable; duration validation will happen "
-            "when each sample is loaded"
-        )
-        return
-
     for index, row in enumerate(rows, start=1):
         try:
-            metadata = info_method(row["audio_path"])
+            metadata = sf.info(row["audio_path"])
         except Exception as exc:
             raise ValueError(
                 f"Cannot read {split_name} audio file {row['audio_path']}: {exc}"
             ) from exc
 
-        if metadata.sample_rate <= 0 or metadata.num_channels <= 0:
+        if metadata.samplerate <= 0 or metadata.channels <= 0:
             raise ValueError(
                 f"Invalid audio metadata for {row['audio_path']}: "
-                f"sample_rate={metadata.sample_rate}, "
-                f"channels={metadata.num_channels}"
+                f"sample_rate={metadata.samplerate}, "
+                f"channels={metadata.channels}"
             )
-        if metadata.num_frames > 0:
-            duration = metadata.num_frames / metadata.sample_rate
+        if metadata.frames > 0:
+            duration = metadata.frames / metadata.samplerate
             if duration < min_duration_seconds or duration > max_duration_seconds:
                 raise ValueError(
                     f"Audio duration {duration:.2f}s is outside the configured "
@@ -274,7 +268,12 @@ class AmharicAudioDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
-        waveform, source_rate = torchaudio.load(row["audio_path"])
+        audio, source_rate = sf.read(
+            row["audio_path"],
+            dtype="float32",
+            always_2d=True,
+        )
+        waveform = torch.from_numpy(audio).transpose(0, 1)
 
         if waveform.ndim != 2 or waveform.shape[0] < 1:
             raise ValueError(f"Invalid audio shape for {row['audio_path']}: {waveform.shape}")
