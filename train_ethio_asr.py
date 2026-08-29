@@ -1,44 +1,39 @@
 #!/usr/bin/env python3
-"""Fine-tune badrex/Ethio-ASR-amharic on local Amharic audio.
+"""Stream all Leyu Amharic dialect datasets and fine-tune Ethio-ASR.
 
-Expected CSV columns:
-    audio_path,text
-
-Optional columns such as speaker_id, dialect, gender, and duration are allowed.
-speaker_id is used for split-leakage warnings and prediction reports; other
-optional columns are ignored. Paths may be absolute or relative to the CSV file.
-
-Required packages:
-    torch, torchaudio, soundfile, transformers, accelerate, jiwer, numpy,
-    safetensors
+The Leyu repositories expose only a ``train`` split. This script performs a
+metadata-only first pass, creates deterministic speaker-disjoint splits inside
+each dialect, and streams audio during training without extracting the complete
+dataset locally.
 
 Example:
-    python train_ethio_asr.py \
-      --train-csv manifests/train.csv \
-      --validation-csv manifests/validation.csv \
-      --test-csv manifests/test.csv \
-      --output-dir outputs/ethio-asr-leyu
+    python train_ethio_asr.py --output-dir outputs/chaka-asr
+
+For gated/private data, run ``hf auth login`` or set ``HF_TOKEN``.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
+import hashlib
+import io
 import json
 import os
 import re
 import sys
 import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
+import fsspec
 import jiwer
 import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from torch.utils.data import Dataset
+from datasets import Audio, concatenate_datasets, load_dataset
 from transformers import (
     AutoModelForCTC,
     AutoProcessor,
@@ -49,262 +44,303 @@ from transformers import (
 )
 
 
+DEFAULT_HF_DATASETS = (
+    "leyu-amharic/leyu-amharic-addis-ababa-dialect",
+    "leyu-amharic/leyu-amharic-gonder-dialect",
+    "leyu-amharic/leyu-amharic-wello-dialect",
+    "leyu-amharic/leyu-amharic-gojjam-dialect",
+    "leyu-amharic/leyu-amharic-shewa-dialect",
+)
+REQUIRED_COLUMNS = {"audio", "text", "dialect", "speaker_id", "gender"}
 WHITESPACE_RE = re.compile(r"\s+")
 
 
 def normalize_amharic_text(text: str) -> str:
-    """Apply conservative normalization without changing Amharic spelling."""
-    text = unicodedata.normalize("NFC", text)
+    text = unicodedata.normalize("NFC", str(text))
     text = text.replace("\u200b", "").replace("\ufeff", "")
     return WHITESPACE_RE.sub(" ", text).strip()
 
 
-def read_manifest(csv_path: str) -> list[dict[str, str]]:
-    manifest_path = Path(csv_path).expanduser().resolve()
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
-    rows: list[dict[str, str]] = []
-    with manifest_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        required = {"audio_path", "text"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(
-                f"{manifest_path} is missing CSV columns: {sorted(missing)}"
-            )
-
-        for line_number, row in enumerate(reader, start=2):
-            audio_value = (row.get("audio_path") or "").strip()
-            text = normalize_amharic_text(row.get("text") or "")
-            if not audio_value or not text:
-                raise ValueError(
-                    f"Empty audio_path or text in {manifest_path}, line {line_number}"
-                )
-
-            audio_path = Path(audio_value).expanduser()
-            if not audio_path.is_absolute():
-                audio_path = manifest_path.parent / audio_path
-            audio_path = audio_path.resolve()
-            if not audio_path.is_file():
-                raise FileNotFoundError(
-                    f"Audio not found in {manifest_path}, line {line_number}: "
-                    f"{audio_path}"
-                )
-
-            item = {"audio_path": str(audio_path), "text": text}
-            speaker_id = (row.get("speaker_id") or "").strip()
-            if speaker_id:
-                item["speaker_id"] = speaker_id
-            rows.append(item)
-
-    if not rows:
-        raise ValueError(f"Manifest is empty: {manifest_path}")
-    return rows
+def repo_slug(repo_id: str) -> str:
+    return repo_id.rsplit("/", 1)[-1].replace("leyu-amharic-", "").replace(
+        "-dialect", ""
+    )
 
 
-def validate_training_configuration(args: argparse.Namespace) -> None:
-    """Fail early on argument combinations that would break or corrupt training."""
-    if args.min_duration_seconds <= 0:
-        raise ValueError("--min-duration-seconds must be greater than zero")
-    if args.max_duration_seconds <= args.min_duration_seconds:
+def stable_speaker_order(repo_id: str, speaker_id: str, seed: int) -> str:
+    return hashlib.sha256(
+        f"{seed}:{repo_id}:{speaker_id}".encode("utf-8")
+    ).hexdigest()
+
+
+def load_streaming_repository(
+    repo_id: str, revision: str, token: str | None
+) -> Any:
+    dataset = load_dataset(
+        repo_id,
+        split="train",
+        streaming=True,
+        revision=revision,
+        token=token,
+    )
+    columns = set(dataset.features or {})
+    missing = REQUIRED_COLUMNS - columns
+    if missing:
         raise ValueError(
-            "--max-duration-seconds must be greater than --min-duration-seconds"
+            f"{repo_id} is missing {sorted(missing)}; available={sorted(columns)}"
         )
-    if args.eval_steps <= 0 or args.save_steps <= 0:
-        raise ValueError("--eval-steps and --save-steps must be greater than zero")
-    if args.save_steps % args.eval_steps != 0:
-        raise ValueError(
-            "--save-steps must be a multiple of --eval-steps when the best "
-            "model is loaded at the end"
+    return dataset.cast_column("audio", Audio(decode=False))
+
+
+def assign_speaker_splits(
+    repo_id: str,
+    speakers: Iterable[str],
+    validation_percent: int,
+    test_percent: int,
+    seed: int,
+) -> dict[str, str]:
+    ordered = sorted(
+        {str(speaker) for speaker in speakers},
+        key=lambda speaker: stable_speaker_order(repo_id, speaker, seed),
+    )
+    if len(ordered) < 3:
+        raise ValueError(f"{repo_id} needs at least 3 speakers")
+
+    validation_count = max(1, round(len(ordered) * validation_percent / 100))
+    test_count = max(1, round(len(ordered) * test_percent / 100))
+    if validation_count + test_count >= len(ordered):
+        raise ValueError(f"Split percentages leave no training speakers in {repo_id}")
+
+    test_speakers = set(ordered[:test_count])
+    validation_speakers = set(
+        ordered[test_count : test_count + validation_count]
+    )
+    return {
+        speaker: (
+            "test"
+            if speaker in test_speakers
+            else "validation"
+            if speaker in validation_speakers
+            else "train"
         )
-    if args.train_batch_size <= 0 or args.eval_batch_size <= 0:
-        raise ValueError("Batch sizes must be greater than zero")
-    if args.gradient_accumulation_steps <= 0:
-        raise ValueError("--gradient-accumulation-steps must be greater than zero")
-
-
-def warn(message: str) -> None:
-    print(f"WARNING: {message}", file=sys.stderr)
-
-
-def validate_split_separation(
-    train_rows: list[dict[str, str]],
-    validation_rows: list[dict[str, str]],
-    test_rows: list[dict[str, str]] | None,
-) -> None:
-    """Prevent direct audio leakage and report likely metadata leakage."""
-    splits = {
-        "train": train_rows,
-        "validation": validation_rows,
+        for speaker in ordered
     }
-    if test_rows is not None:
-        splits["test"] = test_rows
-
-    for split_name, rows in splits.items():
-        audio_paths = [row["audio_path"] for row in rows]
-        duplicate_count = len(audio_paths) - len(set(audio_paths))
-        if duplicate_count:
-            raise ValueError(
-                f"The {split_name} manifest contains {duplicate_count} duplicate "
-                "audio path(s)"
-            )
-
-    split_names = list(splits)
-    for left_index, left_name in enumerate(split_names):
-        for right_name in split_names[left_index + 1 :]:
-            left_rows = splits[left_name]
-            right_rows = splits[right_name]
-
-            shared_audio = {row["audio_path"] for row in left_rows} & {
-                row["audio_path"] for row in right_rows
-            }
-            if shared_audio:
-                examples = "\n  - ".join(sorted(shared_audio)[:5])
-                raise ValueError(
-                    f"Audio leakage between {left_name} and {right_name}: "
-                    f"{len(shared_audio)} shared file(s). Examples:\n  - {examples}"
-                )
-
-            shared_text = {row["text"] for row in left_rows} & {
-                row["text"] for row in right_rows
-            }
-            if shared_text:
-                warn(
-                    f"{left_name} and {right_name} contain "
-                    f"{len(shared_text)} identical transcript(s). This can be "
-                    "legitimate for short phrases, but should be reviewed."
-                )
-
-            left_speakers = {
-                row["speaker_id"] for row in left_rows if row.get("speaker_id")
-            }
-            right_speakers = {
-                row["speaker_id"] for row in right_rows if row.get("speaker_id")
-            }
-            shared_speakers = left_speakers & right_speakers
-            if shared_speakers:
-                warn(
-                    f"{left_name} and {right_name} share "
-                    f"{len(shared_speakers)} speaker_id value(s). Use "
-                    "speaker-disjoint splits when measuring generalization."
-                )
 
 
-def preflight_audio_files(
-    split_name: str,
-    rows: list[dict[str, str]],
-    min_duration_seconds: float,
-    max_duration_seconds: float,
-) -> None:
-    """Read audio headers before training so bad files do not fail hours later."""
-    for index, row in enumerate(rows, start=1):
-        try:
-            metadata = sf.info(row["audio_path"])
-        except Exception as exc:
-            raise ValueError(
-                f"Cannot read {split_name} audio file {row['audio_path']}: {exc}"
-            ) from exc
+def read_streamed_audio(audio_value: Any) -> tuple[torch.Tensor, int, int]:
+    """Decode Audio(decode=False) bytes/path through SoundFile, without FFmpeg."""
+    if isinstance(audio_value, dict) and audio_value.get("array") is not None:
+        array = np.asarray(audio_value["array"], dtype=np.float32)
+        sample_rate = int(audio_value["sampling_rate"])
+        if array.ndim == 1:
+            return torch.from_numpy(array), sample_rate, 1
+        if array.ndim == 2:
+            if array.shape[0] <= 8 and array.shape[0] < array.shape[1]:
+                return torch.from_numpy(array).mean(0), sample_rate, array.shape[0]
+            return torch.from_numpy(array).mean(1), sample_rate, array.shape[1]
+        raise ValueError(f"Unsupported audio shape: {array.shape}")
 
-        if metadata.samplerate <= 0 or metadata.channels <= 0:
-            raise ValueError(
-                f"Invalid audio metadata for {row['audio_path']}: "
-                f"sample_rate={metadata.samplerate}, "
-                f"channels={metadata.channels}"
-            )
-        if metadata.frames > 0:
-            duration = metadata.frames / metadata.samplerate
-            if duration < min_duration_seconds or duration > max_duration_seconds:
-                raise ValueError(
-                    f"Audio duration {duration:.2f}s is outside the configured "
-                    f"range in {split_name}, item {index}: {row['audio_path']}"
-                )
+    payload: bytes | None = None
+    path: str | None = None
+    if isinstance(audio_value, dict):
+        if audio_value.get("bytes") is not None:
+            payload = bytes(audio_value["bytes"])
+        if audio_value.get("path"):
+            path = str(audio_value["path"])
+    elif isinstance(audio_value, (str, os.PathLike)):
+        path = os.fspath(audio_value)
+    else:
+        raise TypeError(f"Unsupported audio value: {type(audio_value)!r}")
 
-
-class AmharicAudioDataset(Dataset):
-    """Loads and resamples audio lazily so 500 hours are not held in RAM."""
-
-    def __init__(
-        self,
-        rows: list[dict[str, str]],
-        processor: Any,
-        sample_rate: int,
-        min_duration_seconds: float,
-        max_duration_seconds: float,
-        validate_vocabulary: bool,
-    ) -> None:
-        self.rows = rows
-        self.processor = processor
-        self.sample_rate = sample_rate
-        self.min_samples = int(min_duration_seconds * sample_rate)
-        self.max_samples = int(max_duration_seconds * sample_rate)
-        self.input_name = processor.model_input_names[0]
-
-        if validate_vocabulary:
-            self._validate_vocabulary()
-
-    def _validate_vocabulary(self) -> None:
-        tokenizer = self.processor.tokenizer
-        unk_id = tokenizer.unk_token_id
-        if unk_id is None:
-            return
-
-        bad_examples: list[str] = []
-        for row in self.rows:
-            token_ids = tokenizer(row["text"], add_special_tokens=False).input_ids
-            if unk_id in token_ids:
-                bad_examples.append(row["text"])
-                if len(bad_examples) == 5:
-                    break
-        if bad_examples:
-            examples = "\n  - ".join(bad_examples)
-            raise ValueError(
-                "The existing Ethio-ASR tokenizer produced <unk> for some "
-                f"transcriptions. Fix text normalization or vocabulary first:\n  - {examples}"
-            )
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        row = self.rows[index]
-        audio, source_rate = sf.read(
-            row["audio_path"],
-            dtype="float32",
-            always_2d=True,
+    if payload is not None:
+        audio, sample_rate = sf.read(
+            io.BytesIO(payload), dtype="float32", always_2d=True
         )
-        waveform = torch.from_numpy(audio).transpose(0, 1)
+    elif path and Path(path).is_file():
+        audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    elif path:
+        with fsspec.open(path, "rb") as handle:
+            audio, sample_rate = sf.read(
+                io.BytesIO(handle.read()), dtype="float32", always_2d=True
+            )
+    else:
+        raise ValueError("Streamed audio has neither bytes nor path")
 
-        if waveform.ndim != 2 or waveform.shape[0] < 1:
-            raise ValueError(f"Invalid audio shape for {row['audio_path']}: {waveform.shape}")
-        waveform = waveform.mean(dim=0)
+    channels = int(audio.shape[1])
+    return torch.from_numpy(audio).mean(1), int(sample_rate), channels
+
+
+def inspect_repositories_and_build_plan(
+    repo_ids: list[str],
+    revision: str,
+    token: str | None,
+    validation_percent: int,
+    test_percent: int,
+    seed: int,
+    audio_samples_per_repo: int,
+) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
+    """Scan projected metadata and construct balanced speaker-level splits."""
+    plan: dict[str, dict[str, str]] = {}
+    report: dict[str, Any] = {
+        "split_policy": {
+            "unit": "speaker_id namespaced by repository",
+            "train_percent": 100 - validation_percent - test_percent,
+            "validation_percent": validation_percent,
+            "test_percent": test_percent,
+            "seed": seed,
+        },
+        "repositories": {},
+    }
+
+    for repo_id in repo_ids:
+        print(f"Scanning metadata: {repo_id}", flush=True)
+        dataset = load_streaming_repository(repo_id, revision, token)
+        metadata = dataset.select_columns(["speaker_id", "gender", "dialect"])
+        speaker_rows: Counter[str] = Counter()
+        gender_rows: Counter[str] = Counter()
+        dialect_rows: Counter[str] = Counter()
+        speaker_gender_rows: dict[str, Counter[str]] = defaultdict(Counter)
+
+        for example in metadata:
+            speaker = str(example["speaker_id"])
+            gender = str(example.get("gender") or "unknown")
+            dialect = str(example.get("dialect") or repo_slug(repo_id))
+            speaker_rows[speaker] += 1
+            gender_rows[gender] += 1
+            dialect_rows[dialect] += 1
+            speaker_gender_rows[speaker][gender] += 1
+
+        if not speaker_rows:
+            raise ValueError(f"{repo_id} is empty")
+        repo_plan = assign_speaker_splits(
+            repo_id,
+            speaker_rows,
+            validation_percent,
+            test_percent,
+            seed,
+        )
+        plan[repo_id] = repo_plan
+
+        split_rows: Counter[str] = Counter()
+        split_speakers: Counter[str] = Counter()
+        split_gender: dict[str, Counter[str]] = defaultdict(Counter)
+        for speaker, rows in speaker_rows.items():
+            split = repo_plan[speaker]
+            split_rows[split] += rows
+            split_speakers[split] += 1
+            split_gender[split].update(speaker_gender_rows[speaker])
+
+        audio_samples: list[dict[str, Any]] = []
+        if audio_samples_per_repo:
+            audio_dataset = load_streaming_repository(repo_id, revision, token)
+            for index, example in enumerate(audio_dataset):
+                if index >= audio_samples_per_repo:
+                    break
+                waveform, sample_rate, channels = read_streamed_audio(example["audio"])
+                audio_samples.append(
+                    {
+                        "duration_seconds": round(waveform.numel() / sample_rate, 3),
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "text_characters": len(
+                            normalize_amharic_text(example.get("text") or "")
+                        ),
+                    }
+                )
+
+        report["repositories"][repo_id] = {
+            "rows": sum(speaker_rows.values()),
+            "speakers": len(speaker_rows),
+            "gender_rows": dict(sorted(gender_rows.items())),
+            "dialect_rows": dict(sorted(dialect_rows.items())),
+            "license": getattr(dataset.info, "license", None),
+            "features": sorted(dataset.features.keys()),
+            "split_rows": dict(sorted(split_rows.items())),
+            "split_speakers": dict(sorted(split_speakers.items())),
+            "split_gender_rows": {
+                split: dict(sorted(counts.items()))
+                for split, counts in sorted(split_gender.items())
+            },
+            "sample_audio": audio_samples,
+        }
+
+    repos = report["repositories"].values()
+    report["totals"] = {
+        "rows": sum(item["rows"] for item in repos),
+        "speakers_namespaced_by_repository": sum(
+            item["speakers"] for item in report["repositories"].values()
+        ),
+        "split_rows": {
+            split: sum(
+                item["split_rows"].get(split, 0)
+                for item in report["repositories"].values()
+            )
+            for split in ("train", "validation", "test")
+        },
+        "split_speakers": {
+            split: sum(
+                item["split_speakers"].get(split, 0)
+                for item in report["repositories"].values()
+            )
+            for split in ("train", "validation", "test")
+        },
+    }
+    return plan, report
+
+
+@dataclass
+class SpeakerSplitFilter:
+    speaker_plan: dict[str, str]
+    split_name: str
+
+    def __call__(self, example: dict[str, Any]) -> bool:
+        speaker = str(example.get("speaker_id"))
+        if speaker not in self.speaker_plan:
+            raise KeyError(f"Speaker {speaker!r} was absent from metadata scan")
+        return self.speaker_plan[speaker] == self.split_name
+
+
+@dataclass
+class StreamingAudioPreprocessor:
+    processor: Any
+    sample_rate: int
+    min_duration_seconds: float
+    max_duration_seconds: float
+    validate_vocabulary: bool
+
+    def __post_init__(self) -> None:
+        self.input_name = self.processor.model_input_names[0]
+        self.unknown_token_id = self.processor.tokenizer.unk_token_id
+
+    def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
+        text = normalize_amharic_text(example.get("text") or "")
+        if not text:
+            raise ValueError("Encountered an empty transcript")
+        waveform, source_rate, _ = read_streamed_audio(example["audio"])
         if source_rate != self.sample_rate:
             waveform = torchaudio.functional.resample(
                 waveform, source_rate, self.sample_rate
             )
-
-        sample_count = waveform.numel()
-        if sample_count < self.min_samples or sample_count > self.max_samples:
-            duration = sample_count / self.sample_rate
+        duration = waveform.numel() / self.sample_rate
+        if not self.min_duration_seconds <= duration <= self.max_duration_seconds:
             raise ValueError(
-                f"Audio duration {duration:.2f}s is outside the configured range "
-                f"for {row['audio_path']}. Segment or filter it without truncating "
-                "the corresponding transcript."
+                f"Audio duration {duration:.2f}s is outside "
+                f"[{self.min_duration_seconds}, {self.max_duration_seconds}]"
             )
 
+        labels = self.processor.tokenizer(text, add_special_tokens=False).input_ids
+        if (
+            self.validate_vocabulary
+            and self.unknown_token_id is not None
+            and self.unknown_token_id in labels
+        ):
+            raise ValueError(f"Tokenizer produced <unk> for: {text[:250]}")
         processed = self.processor(
             waveform.numpy(),
             sampling_rate=self.sample_rate,
             return_attention_mask=True,
         )
-        labels = self.processor.tokenizer(
-            row["text"], add_special_tokens=False
-        ).input_ids
-
-        return {
-            self.input_name: processed[self.input_name][0],
-            "labels": labels,
-        }
+        return {self.input_name: processed[self.input_name][0], "labels": labels}
 
 
 @dataclass
@@ -313,159 +349,244 @@ class DataCollatorCTCWithPadding:
     input_name: str
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        input_features = [
-            {self.input_name: feature[self.input_name]} for feature in features
-        ]
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-
+        inputs = [{self.input_name: item[self.input_name]} for item in features]
+        labels = [{"input_ids": item["labels"]} for item in features]
         batch = self.processor.pad(
-            input_features,
+            inputs,
             padding=True,
             return_attention_mask=True,
             return_tensors="pt",
         )
-        labels_batch = self.processor.tokenizer.pad(
-            label_features,
-            padding=True,
-            return_tensors="pt",
+        label_batch = self.processor.tokenizer.pad(
+            labels, padding=True, return_tensors="pt"
         )
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch["attention_mask"].ne(1), -100
+        batch["labels"] = label_batch["input_ids"].masked_fill(
+            label_batch["attention_mask"].ne(1), -100
         )
-        batch["labels"] = labels
         return batch
+
+
+def make_processed_split(
+    repo_id: str,
+    split_name: str,
+    speaker_plan: dict[str, str],
+    preprocessor: StreamingAudioPreprocessor,
+    revision: str,
+    token: str | None,
+) -> Any:
+    dataset = load_streaming_repository(repo_id, revision, token)
+    source_columns = list(dataset.features.keys())
+    dataset = dataset.filter(SpeakerSplitFilter(speaker_plan, split_name))
+    return dataset.map(preprocessor, remove_columns=source_columns)
+
+
+def build_streaming_datasets(
+    repo_ids: list[str],
+    plan: dict[str, dict[str, str]],
+    preprocessor: StreamingAudioPreprocessor,
+    revision: str,
+    token: str | None,
+    shuffle_buffer: int,
+    seed: int,
+) -> tuple[Any, Any, dict[str, Any]]:
+    train_parts, validation_parts = [], []
+    test_by_dialect: dict[str, Any] = {}
+    for repo_id in repo_ids:
+        print(f"Building stream: {repo_id}", flush=True)
+        train_parts.append(
+            make_processed_split(
+                repo_id, "train", plan[repo_id], preprocessor, revision, token
+            )
+        )
+        validation_parts.append(
+            make_processed_split(
+                repo_id, "validation", plan[repo_id], preprocessor, revision, token
+            )
+        )
+        test_by_dialect[repo_slug(repo_id)] = make_processed_split(
+            repo_id, "test", plan[repo_id], preprocessor, revision, token
+        )
+    train = concatenate_datasets(train_parts).shuffle(
+        seed=seed, buffer_size=shuffle_buffer
+    )
+    validation = concatenate_datasets(validation_parts)
+    return train, validation, test_by_dialect
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-csv", required=True)
-    parser.add_argument("--validation-csv", required=True)
-    parser.add_argument("--test-csv")
-    parser.add_argument("--output-dir", default="outputs/ethio-asr-leyu")
+    parser.add_argument(
+        "--hf-dataset",
+        action="append",
+        dest="hf_datasets",
+        help="Repeat to override the five default Leyu repositories.",
+    )
+    parser.add_argument("--dataset-revision", default="main")
+    parser.add_argument("--hf-token-environment", default="HF_TOKEN")
+    parser.add_argument("--output-dir", default="outputs/chaka-asr")
     parser.add_argument("--model-name", default="badrex/Ethio-ASR-amharic")
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument("--min-duration-seconds", type=float, default=1.0)
-    parser.add_argument("--max-duration-seconds", type=float, default=30.0)
-    parser.add_argument("--train-batch-size", type=int, default=16)
-    parser.add_argument("--eval-batch-size", type=int, default=8)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
-    parser.add_argument("--epochs", type=float, default=5.0)
+    parser.add_argument("--max-duration-seconds", type=float, default=90.0)
+    parser.add_argument("--validation-percent", type=int, default=10)
+    parser.add_argument("--test-percent", type=int, default=10)
+    parser.add_argument("--inspection-audio-samples", type=int, default=3)
+    parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument("--shuffle-buffer", type=int, default=256)
+    parser.add_argument("--max-steps", type=int, default=6_200)
+    parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--eval-steps", type=int, default=500)
-    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--eval-steps", type=int, default=1_000)
+    parser.add_argument("--save-steps", type=int, default=1_000)
     parser.add_argument("--logging-steps", type=int, default=25)
-    parser.add_argument("--dataloader-workers", type=int, default=8)
-    parser.add_argument("--early-stopping-patience", type=int, default=4)
+    parser.add_argument("--dataloader-workers", type=int, default=4)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume-from-checkpoint")
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Use FP16 instead of the default BF16.",
-    )
-    parser.add_argument(
-        "--unfreeze-feature-encoder",
-        action="store_true",
-        help="Train the feature encoder from the beginning.",
-    )
-    parser.add_argument(
-        "--skip-vocabulary-check",
-        action="store_true",
-        help="Do not fail when the tokenizer emits an unknown token.",
-    )
-    parser.add_argument(
-        "--skip-audio-preflight",
-        action="store_true",
-        help="Skip the up-front audio header and duration validation.",
-    )
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--unfreeze-feature-encoder", action="store_true")
+    parser.add_argument("--skip-vocabulary-check", action="store_true")
     return parser.parse_args()
+
+
+def validate_arguments(args: argparse.Namespace, repo_ids: list[str]) -> None:
+    if not repo_ids or len(repo_ids) != len(set(repo_ids)):
+        raise ValueError("Dataset repository list must be non-empty and unique")
+    if args.min_duration_seconds <= 0:
+        raise ValueError("Minimum duration must be positive")
+    if args.max_duration_seconds <= args.min_duration_seconds:
+        raise ValueError("Maximum duration must exceed minimum duration")
+    if args.validation_percent <= 0 or args.test_percent <= 0:
+        raise ValueError("Validation and test percentages must be positive")
+    if args.validation_percent + args.test_percent >= 100:
+        raise ValueError("Validation and test percentages must sum below 100")
+    if args.max_steps <= 0 and not args.inspect_only:
+        raise ValueError("--max-steps must be positive for streaming training")
+    if args.save_steps % args.eval_steps:
+        raise ValueError("--save-steps must be a multiple of --eval-steps")
+    if min(
+        args.train_batch_size,
+        args.eval_batch_size,
+        args.gradient_accumulation_steps,
+        args.shuffle_buffer,
+        args.eval_steps,
+        args.save_steps,
+    ) <= 0:
+        raise ValueError("Batch, step, and buffer values must be positive")
+
+
+def decoded_prediction_texts(prediction: Any, processor: Any) -> tuple[list[str], list[str]]:
+    prediction_ids = prediction.predictions
+    if isinstance(prediction_ids, tuple):
+        prediction_ids = prediction_ids[0]
+    label_ids = np.array(prediction.label_ids, copy=True)
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    hypotheses = [
+        normalize_amharic_text(text)
+        for text in processor.batch_decode(prediction_ids)
+    ]
+    references = [
+        normalize_amharic_text(text)
+        for text in processor.batch_decode(label_ids, group_tokens=False)
+    ]
+    return references, hypotheses
+
+
+def save_predictions(
+    prediction: Any, processor: Any, output_path: Path, dialect: str
+) -> None:
+    references, hypotheses = decoded_prediction_texts(prediction, processor)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for reference, hypothesis in zip(references, hypotheses):
+            handle.write(
+                json.dumps(
+                    {
+                        "dialect": dialect,
+                        "reference": reference,
+                        "prediction": hypothesis,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 def main() -> None:
     args = parse_args()
-    validate_training_configuration(args)
+    repo_ids = args.hf_datasets or list(DEFAULT_HF_DATASETS)
+    validate_arguments(args, repo_ids)
     set_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    token_value = os.environ.get(args.hf_token_environment)
+    token = token_value.strip() if token_value and token_value.strip() else None
+
+    plan, inspection = inspect_repositories_and_build_plan(
+        repo_ids,
+        args.dataset_revision,
+        token,
+        args.validation_percent,
+        args.test_percent,
+        args.seed,
+        args.inspection_audio_samples,
+    )
+    (output_dir / "speaker_split_plan.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "dataset_inspection.json").write_text(
+        json.dumps(inspection, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(inspection, ensure_ascii=False, indent=2), flush=True)
+    if args.inspect_only:
+        print("Inspection complete; training was not started.", flush=True)
+        return
 
     processor = AutoProcessor.from_pretrained(args.model_name)
     model = AutoModelForCTC.from_pretrained(args.model_name)
-    expected_sample_rate = getattr(processor.feature_extractor, "sampling_rate", None)
-    if expected_sample_rate is None:
-        raise AttributeError("The model processor does not define a sampling rate")
-    if args.sample_rate != expected_sample_rate:
+    expected_rate = getattr(processor.feature_extractor, "sampling_rate", None)
+    if expected_rate != args.sample_rate:
         raise ValueError(
-            f"Model processor expects {expected_sample_rate} Hz audio, but "
-            f"--sample-rate is {args.sample_rate} Hz"
+            f"Model expects {expected_rate} Hz; configured {args.sample_rate} Hz"
         )
-
-    tokenizer_size = len(processor.tokenizer)
-    if model.config.vocab_size != tokenizer_size:
-        raise ValueError(
-            f"Model vocabulary size ({model.config.vocab_size}) does not match "
-            f"the tokenizer size ({tokenizer_size})"
-        )
+    if model.config.vocab_size != len(processor.tokenizer):
+        raise ValueError("Model and tokenizer vocabulary sizes do not match")
     if processor.tokenizer.pad_token_id is None:
-        raise ValueError("The CTC tokenizer must define a pad token")
+        raise ValueError("CTC tokenizer must define a pad token")
 
     model.config.ctc_loss_reduction = "mean"
     model.config.ctc_zero_infinity = True
     model.config.pad_token_id = processor.tokenizer.pad_token_id
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
-
     if not args.unfreeze_feature_encoder:
         freeze_method = getattr(model, "freeze_feature_encoder", None)
         if freeze_method is None:
-            raise AttributeError(
-                "This Transformers version does not expose "
-                "model.freeze_feature_encoder(). Upgrade Transformers or use "
-                "--unfreeze-feature-encoder after verifying the model implementation."
-            )
+            raise AttributeError("model.freeze_feature_encoder() is unavailable")
         freeze_method()
 
-    train_rows = read_manifest(args.train_csv)
-    validation_rows = read_manifest(args.validation_csv)
-    test_rows = read_manifest(args.test_csv) if args.test_csv else None
-    validate_split_separation(train_rows, validation_rows, test_rows)
-
-    if not args.skip_audio_preflight:
-        preflight_audio_files(
-            "train",
-            train_rows,
-            args.min_duration_seconds,
-            args.max_duration_seconds,
-        )
-        preflight_audio_files(
-            "validation",
-            validation_rows,
-            args.min_duration_seconds,
-            args.max_duration_seconds,
-        )
-        if test_rows is not None:
-            preflight_audio_files(
-                "test",
-                test_rows,
-                args.min_duration_seconds,
-                args.max_duration_seconds,
-            )
-
-    dataset_kwargs = {
-        "processor": processor,
-        "sample_rate": args.sample_rate,
-        "min_duration_seconds": args.min_duration_seconds,
-        "max_duration_seconds": args.max_duration_seconds,
-        "validate_vocabulary": not args.skip_vocabulary_check,
-    }
-    train_dataset = AmharicAudioDataset(train_rows, **dataset_kwargs)
-    validation_dataset = AmharicAudioDataset(validation_rows, **dataset_kwargs)
-    test_dataset = (
-        AmharicAudioDataset(test_rows, **dataset_kwargs) if test_rows else None
+    preprocessor = StreamingAudioPreprocessor(
+        processor,
+        args.sample_rate,
+        args.min_duration_seconds,
+        args.max_duration_seconds,
+        not args.skip_vocabulary_check,
     )
-
-    input_name = processor.model_input_names[0]
-    collator = DataCollatorCTCWithPadding(processor, input_name)
+    train_dataset, validation_dataset, test_by_dialect = build_streaming_datasets(
+        repo_ids,
+        plan,
+        preprocessor,
+        args.dataset_revision,
+        token,
+        args.shuffle_buffer,
+        args.seed,
+    )
+    collator = DataCollatorCTCWithPadding(
+        processor, processor.model_input_names[0]
+    )
 
     def preprocess_logits_for_metrics(logits: Any, labels: Any) -> torch.Tensor:
         if isinstance(logits, tuple):
@@ -473,52 +594,15 @@ def main() -> None:
         return torch.argmax(logits, dim=-1)
 
     def compute_metrics(prediction: Any) -> dict[str, float]:
-        prediction_ids = prediction.predictions
-        label_ids = np.array(prediction.label_ids, copy=True)
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-
-        predicted_text = [
-            normalize_amharic_text(text)
-            for text in processor.batch_decode(prediction_ids)
-        ]
-        reference_text = [
-            normalize_amharic_text(text)
-            for text in processor.batch_decode(label_ids, group_tokens=False)
-        ]
+        references, hypotheses = decoded_prediction_texts(prediction, processor)
         return {
-            "wer": float(jiwer.wer(reference_text, predicted_text)),
-            "cer": float(jiwer.cer(reference_text, predicted_text)),
+            "wer": float(jiwer.wer(references, hypotheses)),
+            "cer": float(jiwer.cer(references, hypotheses)),
         }
 
-    def save_predictions(
-        prediction: Any,
-        rows: list[dict[str, str]],
-        split_name: str,
-    ) -> None:
-        prediction_ids = prediction.predictions
-        if isinstance(prediction_ids, tuple):
-            prediction_ids = prediction_ids[0]
-        predicted_text = processor.batch_decode(prediction_ids)
-        if len(predicted_text) != len(rows):
-            raise RuntimeError(
-                f"Expected {len(rows)} {split_name} predictions, received "
-                f"{len(predicted_text)}"
-            )
-
-        output_path = Path(args.output_dir) / f"{split_name}_predictions.jsonl"
-        with output_path.open("w", encoding="utf-8") as handle:
-            for row, hypothesis in zip(rows, predicted_text):
-                record = {
-                    "audio_path": row["audio_path"],
-                    "reference": row["text"],
-                    "prediction": normalize_amharic_text(hypothesis),
-                }
-                if row.get("speaker_id"):
-                    record["speaker_id"] = row["speaker_id"]
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir=str(output_dir),
+        max_steps=args.max_steps,
         eval_strategy="steps",
         save_strategy="steps",
         logging_strategy="steps",
@@ -529,7 +613,6 @@ def main() -> None:
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        num_train_epochs=args.epochs,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         lr_scheduler_type="linear",
@@ -541,7 +624,7 @@ def main() -> None:
         optim="adamw_torch_fused",
         dataloader_num_workers=args.dataloader_workers,
         dataloader_pin_memory=True,
-        eval_accumulation_steps=8,
+        eval_accumulation_steps=4,
         load_best_model_at_end=True,
         metric_for_best_model="wer",
         greater_is_better=False,
@@ -552,7 +635,6 @@ def main() -> None:
         seed=args.seed,
         data_seed=args.seed,
     )
-
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -561,18 +643,14 @@ def main() -> None:
         data_collator=collator,
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=args.early_stopping_patience
-            )
-        ],
+        callbacks=[EarlyStoppingCallback(args.early_stopping_patience)],
     )
 
     train_result = trainer.train(
         resume_from_checkpoint=args.resume_from_checkpoint or None
     )
-    trainer.save_model(args.output_dir)
-    processor.save_pretrained(args.output_dir)
+    trainer.save_model(str(output_dir))
+    processor.save_pretrained(str(output_dir))
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
 
@@ -580,26 +658,45 @@ def main() -> None:
         validation_dataset, metric_key_prefix="validation"
     )
     trainer.save_metrics("validation", validation_output.metrics)
-    save_predictions(validation_output, validation_rows, "validation")
+    save_predictions(
+        validation_output,
+        processor,
+        output_dir / "validation_predictions.jsonl",
+        "all",
+    )
 
-    if test_dataset is not None:
-        test_output = trainer.predict(test_dataset, metric_key_prefix="test")
-        trainer.save_metrics("test", test_output.metrics)
-        save_predictions(test_output, test_rows, "test")
+    test_metrics: dict[str, dict[str, float]] = {}
+    for dialect, test_dataset in test_by_dialect.items():
+        print(f"Evaluating held-out {dialect} speakers", flush=True)
+        metric_prefix = f"test_{dialect.replace('-', '_')}"
+        output = trainer.predict(test_dataset, metric_key_prefix=metric_prefix)
+        trainer.save_metrics(metric_prefix, output.metrics)
+        save_predictions(
+            output,
+            processor,
+            output_dir / f"test_{dialect}_predictions.jsonl",
+            dialect,
+        )
+        test_metrics[dialect] = {
+            key: float(value)
+            for key, value in output.metrics.items()
+            if isinstance(value, (int, float))
+        }
 
     summary = {
-        "model": args.model_name,
+        "base_model": args.model_name,
+        "dataset_repositories": repo_ids,
+        "streaming": True,
+        "max_steps": args.max_steps,
         "best_checkpoint": trainer.state.best_model_checkpoint,
         "best_validation_wer": trainer.state.best_metric,
-        "train_examples": len(train_dataset),
-        "validation_examples": len(validation_dataset),
-        "test_examples": len(test_dataset) if test_dataset else 0,
+        "split_totals": inspection["totals"],
+        "test_metrics_by_dialect": test_metrics,
     }
-    summary_path = Path(args.output_dir) / "training_summary.json"
-    summary_path.write_text(
+    (output_dir / "training_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":
