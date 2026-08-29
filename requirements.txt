@@ -1,0 +1,12 @@
+# Install PyTorch and TorchAudio from the official PyTorch CUDA index when your
+# GPU requires a specific CUDA build. Keep their major/minor versions aligned.
+torch>=2.6.0
+torchaudio>=2.6.0
+
+# ASR training stack
+transformers>=4.50.0
+accelerate>=1.2.0
+jiwer>=3.0.0
+numpy>=1.26.0
+safetensors>=0.4.5
+
