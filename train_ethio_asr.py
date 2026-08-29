@@ -4,9 +4,12 @@
 Expected CSV columns:
     audio_path,text
 
-Optional columns such as speaker_id, dialect, gender, and duration are allowed
-and ignored by this training script. Paths may be absolute or relative to the
-CSV file.
+Optional columns such as speaker_id, dialect, gender, and duration are allowed.
+speaker_id is used for split-leakage warnings and prediction reports; other
+optional columns are ignored. Paths may be absolute or relative to the CSV file.
+
+Required packages:
+    torch, torchaudio, transformers, accelerate, jiwer, numpy, safetensors
 
 Example:
     python train_ethio_asr.py \
@@ -23,6 +26,7 @@ import csv
 import json
 import os
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,11 +90,141 @@ def read_manifest(csv_path: str) -> list[dict[str, str]]:
                     f"{audio_path}"
                 )
 
-            rows.append({"audio_path": str(audio_path), "text": text})
+            item = {"audio_path": str(audio_path), "text": text}
+            speaker_id = (row.get("speaker_id") or "").strip()
+            if speaker_id:
+                item["speaker_id"] = speaker_id
+            rows.append(item)
 
     if not rows:
         raise ValueError(f"Manifest is empty: {manifest_path}")
     return rows
+
+
+def validate_training_configuration(args: argparse.Namespace) -> None:
+    """Fail early on argument combinations that would break or corrupt training."""
+    if args.min_duration_seconds <= 0:
+        raise ValueError("--min-duration-seconds must be greater than zero")
+    if args.max_duration_seconds <= args.min_duration_seconds:
+        raise ValueError(
+            "--max-duration-seconds must be greater than --min-duration-seconds"
+        )
+    if args.eval_steps <= 0 or args.save_steps <= 0:
+        raise ValueError("--eval-steps and --save-steps must be greater than zero")
+    if args.save_steps % args.eval_steps != 0:
+        raise ValueError(
+            "--save-steps must be a multiple of --eval-steps when the best "
+            "model is loaded at the end"
+        )
+    if args.train_batch_size <= 0 or args.eval_batch_size <= 0:
+        raise ValueError("Batch sizes must be greater than zero")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be greater than zero")
+
+
+def warn(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr)
+
+
+def validate_split_separation(
+    train_rows: list[dict[str, str]],
+    validation_rows: list[dict[str, str]],
+    test_rows: list[dict[str, str]] | None,
+) -> None:
+    """Prevent direct audio leakage and report likely metadata leakage."""
+    splits = {
+        "train": train_rows,
+        "validation": validation_rows,
+    }
+    if test_rows is not None:
+        splits["test"] = test_rows
+
+    for split_name, rows in splits.items():
+        audio_paths = [row["audio_path"] for row in rows]
+        duplicate_count = len(audio_paths) - len(set(audio_paths))
+        if duplicate_count:
+            raise ValueError(
+                f"The {split_name} manifest contains {duplicate_count} duplicate "
+                "audio path(s)"
+            )
+
+    split_names = list(splits)
+    for left_index, left_name in enumerate(split_names):
+        for right_name in split_names[left_index + 1 :]:
+            left_rows = splits[left_name]
+            right_rows = splits[right_name]
+
+            shared_audio = {row["audio_path"] for row in left_rows} & {
+                row["audio_path"] for row in right_rows
+            }
+            if shared_audio:
+                examples = "\n  - ".join(sorted(shared_audio)[:5])
+                raise ValueError(
+                    f"Audio leakage between {left_name} and {right_name}: "
+                    f"{len(shared_audio)} shared file(s). Examples:\n  - {examples}"
+                )
+
+            shared_text = {row["text"] for row in left_rows} & {
+                row["text"] for row in right_rows
+            }
+            if shared_text:
+                warn(
+                    f"{left_name} and {right_name} contain "
+                    f"{len(shared_text)} identical transcript(s). This can be "
+                    "legitimate for short phrases, but should be reviewed."
+                )
+
+            left_speakers = {
+                row["speaker_id"] for row in left_rows if row.get("speaker_id")
+            }
+            right_speakers = {
+                row["speaker_id"] for row in right_rows if row.get("speaker_id")
+            }
+            shared_speakers = left_speakers & right_speakers
+            if shared_speakers:
+                warn(
+                    f"{left_name} and {right_name} share "
+                    f"{len(shared_speakers)} speaker_id value(s). Use "
+                    "speaker-disjoint splits when measuring generalization."
+                )
+
+
+def preflight_audio_files(
+    split_name: str,
+    rows: list[dict[str, str]],
+    min_duration_seconds: float,
+    max_duration_seconds: float,
+) -> None:
+    """Read audio headers before training so bad files do not fail hours later."""
+    info_method = getattr(torchaudio, "info", None)
+    if info_method is None:
+        warn(
+            "torchaudio.info() is unavailable; duration validation will happen "
+            "when each sample is loaded"
+        )
+        return
+
+    for index, row in enumerate(rows, start=1):
+        try:
+            metadata = info_method(row["audio_path"])
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot read {split_name} audio file {row['audio_path']}: {exc}"
+            ) from exc
+
+        if metadata.sample_rate <= 0 or metadata.num_channels <= 0:
+            raise ValueError(
+                f"Invalid audio metadata for {row['audio_path']}: "
+                f"sample_rate={metadata.sample_rate}, "
+                f"channels={metadata.num_channels}"
+            )
+        if metadata.num_frames > 0:
+            duration = metadata.num_frames / metadata.sample_rate
+            if duration < min_duration_seconds or duration > max_duration_seconds:
+                raise ValueError(
+                    f"Audio duration {duration:.2f}s is outside the configured "
+                    f"range in {split_name}, item {index}: {row['audio_path']}"
+                )
 
 
 class AmharicAudioDataset(Dataset):
@@ -188,6 +322,7 @@ class DataCollatorCTCWithPadding:
         batch = self.processor.pad(
             input_features,
             padding=True,
+            return_attention_mask=True,
             return_tensors="pt",
         )
         labels_batch = self.processor.tokenizer.pad(
@@ -241,17 +376,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not fail when the tokenizer emits an unknown token.",
     )
+    parser.add_argument(
+        "--skip-audio-preflight",
+        action="store_true",
+        help="Skip the up-front audio header and duration validation.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    validate_training_configuration(args)
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
     processor = AutoProcessor.from_pretrained(args.model_name)
     model = AutoModelForCTC.from_pretrained(args.model_name)
+    expected_sample_rate = getattr(processor.feature_extractor, "sampling_rate", None)
+    if expected_sample_rate is None:
+        raise AttributeError("The model processor does not define a sampling rate")
+    if args.sample_rate != expected_sample_rate:
+        raise ValueError(
+            f"Model processor expects {expected_sample_rate} Hz audio, but "
+            f"--sample-rate is {args.sample_rate} Hz"
+        )
+
+    tokenizer_size = len(processor.tokenizer)
+    if model.config.vocab_size != tokenizer_size:
+        raise ValueError(
+            f"Model vocabulary size ({model.config.vocab_size}) does not match "
+            f"the tokenizer size ({tokenizer_size})"
+        )
+    if processor.tokenizer.pad_token_id is None:
+        raise ValueError("The CTC tokenizer must define a pad token")
+
     model.config.ctc_loss_reduction = "mean"
+    model.config.ctc_zero_infinity = True
     model.config.pad_token_id = processor.tokenizer.pad_token_id
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -269,6 +429,28 @@ def main() -> None:
     train_rows = read_manifest(args.train_csv)
     validation_rows = read_manifest(args.validation_csv)
     test_rows = read_manifest(args.test_csv) if args.test_csv else None
+    validate_split_separation(train_rows, validation_rows, test_rows)
+
+    if not args.skip_audio_preflight:
+        preflight_audio_files(
+            "train",
+            train_rows,
+            args.min_duration_seconds,
+            args.max_duration_seconds,
+        )
+        preflight_audio_files(
+            "validation",
+            validation_rows,
+            args.min_duration_seconds,
+            args.max_duration_seconds,
+        )
+        if test_rows is not None:
+            preflight_audio_files(
+                "test",
+                test_rows,
+                args.min_duration_seconds,
+                args.max_duration_seconds,
+            )
 
     dataset_kwargs = {
         "processor": processor,
@@ -296,12 +478,45 @@ def main() -> None:
         label_ids = np.array(prediction.label_ids, copy=True)
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-        predicted_text = processor.batch_decode(prediction_ids)
-        reference_text = processor.batch_decode(label_ids, group_tokens=False)
+        predicted_text = [
+            normalize_amharic_text(text)
+            for text in processor.batch_decode(prediction_ids)
+        ]
+        reference_text = [
+            normalize_amharic_text(text)
+            for text in processor.batch_decode(label_ids, group_tokens=False)
+        ]
         return {
             "wer": float(jiwer.wer(reference_text, predicted_text)),
             "cer": float(jiwer.cer(reference_text, predicted_text)),
         }
+
+    def save_predictions(
+        prediction: Any,
+        rows: list[dict[str, str]],
+        split_name: str,
+    ) -> None:
+        prediction_ids = prediction.predictions
+        if isinstance(prediction_ids, tuple):
+            prediction_ids = prediction_ids[0]
+        predicted_text = processor.batch_decode(prediction_ids)
+        if len(predicted_text) != len(rows):
+            raise RuntimeError(
+                f"Expected {len(rows)} {split_name} predictions, received "
+                f"{len(predicted_text)}"
+            )
+
+        output_path = Path(args.output_dir) / f"{split_name}_predictions.jsonl"
+        with output_path.open("w", encoding="utf-8") as handle:
+            for row, hypothesis in zip(rows, predicted_text):
+                record = {
+                    "audio_path": row["audio_path"],
+                    "reference": row["text"],
+                    "prediction": normalize_amharic_text(hypothesis),
+                }
+                if row.get("speaker_id"):
+                    record["speaker_id"] = row["speaker_id"]
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -362,14 +577,16 @@ def main() -> None:
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
 
-    validation_metrics = trainer.evaluate(
+    validation_output = trainer.predict(
         validation_dataset, metric_key_prefix="validation"
     )
-    trainer.save_metrics("validation", validation_metrics)
+    trainer.save_metrics("validation", validation_output.metrics)
+    save_predictions(validation_output, validation_rows, "validation")
 
     if test_dataset is not None:
-        test_metrics = trainer.evaluate(test_dataset, metric_key_prefix="test")
-        trainer.save_metrics("test", test_metrics)
+        test_output = trainer.predict(test_dataset, metric_key_prefix="test")
+        trainer.save_metrics("test", test_output.metrics)
+        save_predictions(test_output, test_rows, "test")
 
     summary = {
         "model": args.model_name,
